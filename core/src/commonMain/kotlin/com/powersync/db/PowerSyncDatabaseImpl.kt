@@ -1,7 +1,5 @@
 package com.powersync.db
 
-import app.cash.sqldelight.async.coroutines.awaitAsList
-import app.cash.sqldelight.async.coroutines.awaitAsOne
 import app.cash.sqldelight.db.SqlCursor
 import co.touchlab.kermit.Logger
 import com.powersync.DatabaseDriverFactory
@@ -69,7 +67,7 @@ internal class PowerSyncDatabaseImpl(
 
     init {
         runBlocking {
-            val sqliteVersion = internalDb.queries.sqliteVersion().awaitAsOne()
+            val sqliteVersion = internalDb.queries.sqliteVersion().executeAsOne()
             logger.d { "SQLiteVersion: $sqliteVersion" }
             checkVersion()
             logger.d { "PowerSyncVersion: ${getPowerSyncVersion()}" }
@@ -82,9 +80,11 @@ internal class PowerSyncDatabaseImpl(
     private suspend fun applySchema() {
         val schemaJson = JsonUtil.json.encodeToString(schema)
 
+        println("PowerSyncDatabaseImpl-applySchema()-start")
         this.writeTransaction { tx ->
-            internalDb.queries.replaceSchema(schemaJson).awaitAsOne()
+            internalDb.queries.replaceSchema(schemaJson).executeAsOne()
         }
+        println("PowerSyncDatabaseImpl-applySchema()-end")
     }
 
     @OptIn(FlowPreview::class)
@@ -142,7 +142,7 @@ internal class PowerSyncDatabaseImpl(
         }
 
         val entries =
-            internalDb.queries.getCrudEntries((limit + 1).toLong()).awaitAsList().map {
+            internalDb.queries.getCrudEntries((limit + 1).toLong()).executeAsList().map {
                 CrudEntry.fromRow(
                     CrudRow(
                         id = it.id.toString(),
@@ -177,7 +177,7 @@ internal class PowerSyncDatabaseImpl(
                 if (txId == null) {
                     listOf(entry)
                 } else {
-                    internalDb.queries.getCrudEntryByTxId(txId.toLong()).awaitAsList().map {
+                    internalDb.queries.getCrudEntryByTxId(txId.toLong()).executeAsList().map {
                         CrudEntry.fromRow(
                             CrudRow(
                                 id = it.id.toString(),
@@ -199,7 +199,7 @@ internal class PowerSyncDatabaseImpl(
         }
     }
 
-    override suspend fun getPowerSyncVersion(): String = internalDb.queries.powerSyncVersion().awaitAsOne()
+    override suspend fun getPowerSyncVersion(): String = internalDb.queries.powerSyncVersion().executeAsOne()
 
     override suspend fun <RowType : Any> get(
         sql: String,
@@ -275,8 +275,8 @@ internal class PowerSyncDatabaseImpl(
     override suspend fun disconnectAndClear(clearLocal: Boolean) {
         disconnect()
 
-        this.writeTransaction {
-            internalDb.queries.powersyncClear(if (clearLocal) "1" else "0").awaitAsOne()
+        internalDb.transactor.transactionWithResult {
+            internalDb.queries.powersyncClear(if (clearLocal) "1" else "0").executeAsOne()
         }
         currentStatus.update(lastSyncedAt = null, hasSynced = false)
     }
