@@ -15,6 +15,7 @@ import com.powersync.db.crud.CrudTransaction
 import com.powersync.db.internal.InternalDatabaseImpl
 import com.powersync.db.internal.InternalTable
 import com.powersync.db.internal.PowerSyncTransaction
+import com.powersync.db.internal.execute
 import com.powersync.db.schema.Schema
 import com.powersync.sync.SyncStatus
 import com.powersync.sync.SyncStream
@@ -22,14 +23,20 @@ import com.powersync.utils.JsonParam
 import com.powersync.utils.JsonUtil
 import com.powersync.utils.toJsonObject
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.datetime.Instant
 import kotlinx.datetime.toLocalDateTime
 import kotlinx.serialization.encodeToString
@@ -54,6 +61,103 @@ internal class PowerSyncDatabaseImpl(
     private val internalDb = InternalDatabaseImpl(driver, scope)
     private val bucketStorage: BucketStorage = BucketStorageImpl(internalDb, logger)
 
+    internal class ChannelPowerSyncTransaction: PowerSyncTransaction{
+        internal val operationChannel = Channel<Operation<*>>()
+        fun finish(){
+            operationChannel.close()
+        }
+
+        override suspend fun execute(
+            sql: String,
+            parameters: List<Any?>?
+        ): Long {
+            val op = Operation.Execute(sql, parameters)
+            operationChannel.send(op)
+            return op.resultQueue.receive()
+        }
+
+        override suspend fun <RowType : Any> getOptional(
+            sql: String,
+            parameters: List<Any?>?,
+            mapper: (SqlCursor) -> RowType
+        ): RowType? {
+            val op = Operation.GetOptional(sql, parameters, mapper)
+            operationChannel.send(op)
+            return op.resultQueue.receive()
+        }
+
+        override suspend fun <RowType : Any> getAll(
+            sql: String,
+            parameters: List<Any?>?,
+            mapper: (SqlCursor) -> RowType
+        ): List<RowType> {
+            val op = Operation.GetAll(sql, parameters, mapper)
+            operationChannel.send(op)
+            return op.resultQueue.receive()
+        }
+
+        override suspend fun <RowType : Any> get(
+            sql: String,
+            parameters: List<Any?>?,
+            mapper: (SqlCursor) -> RowType
+        ): RowType {
+            val op = Operation.Get(sql, parameters, mapper)
+            operationChannel.send(op)
+            return op.resultQueue.receive()
+        }
+
+        sealed class Operation<R> {
+            val resultQueue = Channel<R>()
+            abstract fun runSync(internalDb: InternalDatabaseImpl):R
+
+            suspend fun result(r:Any?){
+                resultQueue.send(r as R)
+                resultQueue.close()
+            }
+
+            fun error(t: Throwable){
+                resultQueue.close(t)
+            }
+
+            data class Execute(
+                val sql: String, val parameters: List<Any?>?,
+            ) : Operation<Long>() {
+                override fun runSync(internalDb: InternalDatabaseImpl): Long =internalDb.execute(sql, parameters)
+            }
+
+            data class Get<RowType : Any>(
+                val sql: String,
+                val parameters: List<Any?>?,
+                val mapper: (SqlCursor) -> RowType,
+                ) : Operation<RowType>() {
+
+                override fun runSync(internalDb: InternalDatabaseImpl):RowType {
+                    val r = internalDb.get(sql, parameters, mapper)
+                    requireNotNull(r) { "Query returned no result" }
+                    return r
+                }
+            }
+
+            data class GetAll<RowType : Any>(
+                val sql: String,
+                val parameters: List<Any?>?,
+                val mapper: (SqlCursor) -> RowType,
+            ) : Operation<List<RowType>>() {
+                override fun runSync(internalDb: InternalDatabaseImpl):List<RowType> =
+                    internalDb.getAll(sql, parameters, mapper)
+            }
+
+            data class GetOptional<RowType : Any>(
+                val sql: String,
+                val parameters: List<Any?>?,
+                val mapper: (SqlCursor) -> RowType,
+            ) : Operation<RowType?>() {
+                override fun runSync(internalDb: InternalDatabaseImpl):RowType? =
+                    internalDb.getOptional(sql, parameters, mapper)
+            }
+        }
+    }
+
     /**
      * The current sync status.
      */
@@ -77,14 +181,12 @@ internal class PowerSyncDatabaseImpl(
         }
     }
 
-    private suspend fun applySchema() {
+    private fun applySchema() {
         val schemaJson = JsonUtil.json.encodeToString(schema)
 
-        println("PowerSyncDatabaseImpl-applySchema()-start")
-        this.writeTransaction { tx ->
+        internalDb.transactor.transactionWithResult {
             internalDb.queries.replaceSchema(schemaJson).executeAsOne()
         }
-        println("PowerSyncDatabaseImpl-applySchema()-end")
     }
 
     @OptIn(FlowPreview::class)
@@ -225,29 +327,68 @@ internal class PowerSyncDatabaseImpl(
         mapper: (SqlCursor) -> RowType,
     ): Flow<List<RowType>> = internalDb.watch(sql, parameters, mapper)
 
-    override suspend fun <R> readTransaction(callback: suspend (tx: PowerSyncTransaction) -> R): R = internalDb.writeTransaction(callback)
+    override suspend fun <R> readTransaction(callback: suspend (tx: PowerSyncTransaction) -> R): R = asyncTransaction(callback)
 
-    override suspend fun <R> writeTransaction(callback: suspend (tx: PowerSyncTransaction) -> R): R = internalDb.writeTransaction(callback)
+    override suspend fun <R> writeTransaction(callback: suspend (tx: PowerSyncTransaction) -> R): R = asyncTransaction(callback)
+
+    private suspend fun <R> asyncTransaction(callback: suspend (tx: PowerSyncTransaction) -> R): R {
+        val t = ChannelPowerSyncTransaction()
+
+        val mainResult = withContext(Dispatchers.IO) {
+            val topLoop = async {
+                val callbackResult = callback(t)
+                t.finish()
+                callbackResult
+            }
+
+            withContext(Dispatchers.IO) {
+                internalDb.transactor.transactionWithResult(noEnclosing = true) {
+                    try {
+                        while (true) {
+                            val op = runBlocking {
+                                t.operationChannel.receive()
+                            }
+                            try {
+                                val result = op.runSync(internalDb)
+                                runBlocking {
+                                    op.result(result)
+                                }
+                            } catch (e: Exception) {
+                                runBlocking {
+                                    op.error(e)
+                                }
+                            }
+                        }
+                    } catch (e: ClosedReceiveChannelException) {
+                    }
+                }
+            }
+
+            topLoop.await()
+        }
+
+        return mainResult
+    }
 
     override suspend fun execute(
         sql: String,
         parameters: List<Any?>?,
     ): Long = internalDb.execute(sql, parameters)
 
-    private suspend fun handleWriteCheckpoint(
+    private fun handleWriteCheckpoint(
         lastTransactionId: Int,
         writeCheckpoint: String?,
     ) {
-        writeTransaction { tx ->
+        internalDb.transactor.transactionWithResult {
             internalDb.queries.deleteEntriesWithIdLessThan(lastTransactionId.toLong())
 
-            if (writeCheckpoint != null && !bucketStorage.hasCrud()) {
-                tx.execute(
+            if (writeCheckpoint != null && !runBlocking { bucketStorage.hasCrud() }) {
+                internalDb.driver.execute(
                     "UPDATE ps_buckets SET target_op = CAST(? AS INTEGER) WHERE name='\$local'",
                     listOf(writeCheckpoint),
                 )
             } else {
-                tx.execute(
+                internalDb.driver.execute(
                     "UPDATE ps_buckets SET target_op = CAST(? AS INTEGER) WHERE name='\$local'",
                     listOf(bucketStorage.getMaxOpId()),
                 )

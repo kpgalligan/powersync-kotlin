@@ -6,7 +6,7 @@ import com.powersync.db.Queries
 import com.powersync.persistence.PsDatabase
 import kotlinx.coroutines.flow.Flow
 
-internal interface InternalDatabase : Queries {
+internal interface InternalDatabase : SyncQueries {
     val driver: PsSqlDriver
     val transactor: PsDatabase
     val queries: PowersyncQueries

@@ -12,20 +12,27 @@ import com.persistence.PowersyncQueries
 import com.powersync.PsSqlDriver
 import com.powersync.persistence.PsDatabase
 import com.powersync.utils.JsonUtil
-import kotlinx.atomicfu.AtomicRef
-import kotlinx.atomicfu.atomic
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
-import kotlinx.coroutines.IO
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
+
+internal fun SqlDriver.execute(
+    sql: String,
+    parameters: List<Any?>?,
+): Long {
+    val numParams = parameters?.size ?: 0
+    val result = execute(
+            identifier = null,
+            sql = sql,
+            parameters = numParams,
+            binders = getBindersFromParams(parameters),
+        ).value
+    return result
+}
 
 @OptIn(FlowPreview::class)
 internal class InternalDatabaseImpl(
@@ -34,198 +41,6 @@ internal class InternalDatabaseImpl(
 ) : InternalDatabase {
     override val transactor: PsDatabase = PsDatabase(driver)
     override val queries: PowersyncQueries = transactor.powersyncQueries
-    private val transaction =
-        object : PowerSyncTransaction {
-            override suspend fun execute(
-                sql: String,
-                parameters: List<Any?>?,
-            ): Long = this@InternalDatabaseImpl.execute(sql, parameters ?: emptyList())
-
-            override suspend fun <RowType : Any> get(
-                sql: String,
-                parameters: List<Any?>?,
-                mapper: (SqlCursor) -> RowType,
-            ): RowType = this@InternalDatabaseImpl.get(sql, parameters ?: emptyList(), mapper)
-
-            override suspend fun <RowType : Any> getAll(
-                sql: String,
-                parameters: List<Any?>?,
-                mapper: (SqlCursor) -> RowType,
-            ): List<RowType> = this@InternalDatabaseImpl.getAll(sql, parameters ?: emptyList(), mapper)
-
-            override suspend fun <RowType : Any> getOptional(
-                sql: String,
-                parameters: List<Any?>?,
-                mapper: (SqlCursor) -> RowType,
-            ): RowType? = this@InternalDatabaseImpl.getOptional(sql, parameters ?: emptyList(), mapper)
-        }
-
-    internal class SerialPowerSyncTransaction<R> : PowerSyncTransaction {
-        internal val currentOperation = atomic<Operation<*>?>(null)
-
-        internal fun nextOperation(): Operation<*>{
-            var op = currentOperation.value
-            while (op == null){
-                op = currentOperation.value
-            }
-            return op
-        }
-
-        private suspend fun <R : Any> waitOnResult(operation: Operation<R>): R {
-            var result: R? = operation.operationResult
-            while (result == null) {
-                delay(100)
-                result = operation.operationResult
-            }
-            return result
-        }
-
-        private fun setNullOnly(op: Operation<*>) {
-            if (!currentOperation.compareAndSet(null, op)) {
-                throw IllegalStateException("Operation should be null but is ${currentOperation.value}")
-            }
-        }
-
-        override suspend fun execute(
-            sql: String,
-            parameters: List<Any?>?,
-        ): Long {
-            val operation = Operation.Execute(sql, parameters)
-            setNullOnly(operation)
-            return waitOnResult(operation)
-        }//withContext(serialContext) { this@InternalDatabaseImpl.execute(sql, parameters ?: emptyList()) }
-
-        override suspend fun <RowType : Any> get(
-            sql: String,
-            parameters: List<Any?>?,
-            mapper: (SqlCursor) -> RowType,
-        ): RowType {
-            val operation = Operation.Get(sql, parameters, mapper)
-            setNullOnly(operation)
-            return waitOnResult(operation)
-        }//= withContext(serialContext) { this@InternalDatabaseImpl.get(sql, parameters ?: emptyList(), mapper)}
-
-        override suspend fun <RowType : Any> getAll(
-            sql: String,
-            parameters: List<Any?>?,
-            mapper: (SqlCursor) -> RowType,
-        ): List<RowType> {
-            val operation = Operation.GetAll(sql, parameters, mapper)
-            setNullOnly(operation)
-            return waitOnResult(operation)
-        }// = withContext(serialContext) { this@InternalDatabaseImpl.getAll(sql, parameters ?: emptyList(), mapper)}
-
-        override suspend fun <RowType : Any> getOptional(
-            sql: String,
-            parameters: List<Any?>?,
-            mapper: (SqlCursor) -> RowType,
-        ): RowType? {
-            val operation = Operation.GetAll(sql, parameters, mapper)
-            setNullOnly(operation)
-            return waitOnResult(operation).firstOrNull()
-        }//= withContext(serialContext) { this@InternalDatabaseImpl.getOptional(sql, parameters ?: emptyList(), mapper)}
-
-        sealed interface Operation<R : Any> {
-            val operationResult: R?
-            fun runSync(driver: SqlDriver)
-
-            fun <T : Any> createQuery(
-                driver: SqlDriver,
-                query: String,
-                mapper: (SqlCursor) -> T,
-                parameters: Int = 0,
-                binders: (SqlPreparedStatement.() -> Unit)? = null,
-            ): ExecutableQuery<T> =
-                object : ExecutableQuery<T>(mapper) {
-                    override fun <R> execute(mapper: (SqlCursor) -> QueryResult<R>): QueryResult<R> =
-                        driver.executeQuery(null, query, mapper, parameters, binders)
-                }
-
-            data class Execute(
-                val sql: String, val parameters: List<Any?>?,
-            ) : Operation<Long> {
-                val result: AtomicRef<Long?> = atomic<Long?>(null)
-                override val operationResult: Long?
-                    get() = result.value
-
-                override fun runSync(driver: SqlDriver) {
-                    val numParams = parameters?.size ?: 0
-                    val r = driver
-                        .execute(
-                            identifier = null,
-                            sql = sql,
-                            parameters = numParams,
-                            binders = getBindersFromParams(parameters),
-                        ).value
-                    result.value = r
-                }
-            }
-
-            data class Get<RowType : Any>(
-                val sql: String,
-                val parameters: List<Any?>?,
-                val mapper: (SqlCursor) -> RowType,
-
-                ) : Operation<RowType> {
-                val result: AtomicRef<RowType?> = atomic<RowType?>(null)
-                override val operationResult: RowType?
-                    get() = result.value
-
-                override fun runSync(driver: SqlDriver) {
-                    val r =
-                        createQuery(
-                            driver = driver,
-                            query = sql,
-                            parameters = parameters?.size ?: 0,
-                            binders = getBindersFromParams(parameters),
-                            mapper = mapper,
-                        ).executeAsOneOrNull()
-                    requireNotNull(r) { "Query returned no result" }
-                    result.value = r
-                }
-            }
-
-            data class GetAll<RowType : Any>(
-                val sql: String,
-                val parameters: List<Any?>?,
-                val mapper: (SqlCursor) -> RowType,
-            ) : Operation<List<RowType>> {
-                val result: AtomicRef<List<RowType>?> = atomic<List<RowType>?>(null)
-                override val operationResult: List<RowType>?
-                    get() = result.value
-
-                override fun runSync(driver: SqlDriver) {
-                    result.value = createQuery(
-                        driver = driver,
-                        query = sql,
-                        parameters = parameters?.size ?: 0,
-                        binders = getBindersFromParams(parameters),
-                        mapper = mapper,
-                    ).executeAsList()
-                }
-            }
-
-            data class GetOptional<RowType : Any>(
-                val sql: String,
-                val parameters: List<Any?>?,
-                val mapper: (SqlCursor) -> RowType,
-            ) : Operation<List<RowType>> {
-                val result = atomic<List<RowType>?>(null)
-                override val operationResult: List<RowType>?
-                    get() = result.value
-
-                override fun runSync(driver: SqlDriver) {
-                    result.value = createQuery(
-                        driver = driver,
-                        query = sql,
-                        parameters = parameters?.size ?: 0,
-                        binders = getBindersFromParams(parameters),
-                        mapper = mapper,
-                    ).executeAsList()
-                }
-            }
-        }
-    }
 
     companion object {
         const val POWERSYNC_TABLE_MATCH: String = "(^ps_data__|^ps_data_local__)"
@@ -248,24 +63,12 @@ internal class InternalDatabaseImpl(
         }
     }
 
-    override suspend fun execute(
+    override fun execute(
         sql: String,
         parameters: List<Any?>?,
-    ): Long {
-        val numParams = parameters?.size ?: 0
-        println("InternalDatabaseImpl-execute-start")
-        val result = driver
-            .execute(
-                identifier = null,
-                sql = sql,
-                parameters = numParams,
-                binders = getBindersFromParams(parameters),
-            ).value
-        println("InternalDatabaseImpl-execute-end")
-        return result
-    }
+    ): Long = driver.execute(sql, parameters)
 
-    override suspend fun <RowType : Any> get(
+    override fun <RowType : Any> get(
         sql: String,
         parameters: List<Any?>?,
         mapper: (SqlCursor) -> RowType,
@@ -281,7 +84,7 @@ internal class InternalDatabaseImpl(
         return requireNotNull(result) { "Query returned no result" }
     }
 
-    override suspend fun <RowType : Any> getAll(
+    override fun <RowType : Any> getAll(
         sql: String,
         parameters: List<Any?>?,
         mapper: (SqlCursor) -> RowType,
@@ -294,7 +97,7 @@ internal class InternalDatabaseImpl(
                 mapper = mapper,
             ).executeAsList()
 
-    override suspend fun <RowType : Any> getOptional(
+    override fun <RowType : Any> getOptional(
         sql: String,
         parameters: List<Any?>?,
         mapper: (SqlCursor) -> RowType,
@@ -357,38 +160,17 @@ internal class InternalDatabaseImpl(
             }
         }
 
-    override suspend fun <R> readTransaction(callback: suspend (PowerSyncTransaction) -> R): R =
+    override fun <R> readTransaction(callback: (SyncQueries) -> R): R =
         transactor.transactionWithResult(noEnclosing = true) {
             println("readTransaction-runBlocking")
-            runBlocking {
-                callback(transaction)
-            }
+            callback(this@InternalDatabaseImpl)
         }
 
-    override suspend fun <R> writeTransaction(callback: suspend (PowerSyncTransaction) -> R): R {
-        return withContext(Dispatchers.IO) {
-            val transacter = SerialPowerSyncTransaction<R>()
-            val job = launch {
-                callback(transacter)
-            }
-
-            println("serial-transactionWithResult-beforeStart")
-            val result = transactor.transactionWithResult(noEnclosing = true) {
-                println("serial-transactionWithResult-start-${currentThreadId()}")
-                var opResult:Any? = null
-                while (job.isActive){
-                    val nextOperation = transacter.nextOperation()
-                    println("serial-transactionWithResult-running-${currentThreadId()}")
-                    opResult = nextOperation.runSync(driver)
-                    nextOperation.operationResult
-                }
-                println("serial-transactionWithResult-end-${currentThreadId()}")
-                opResult
-            } as R
-
-            return@withContext result
+    override fun <R> writeTransaction(callback: (SyncQueries) -> R): R =
+        transactor.transactionWithResult(noEnclosing = true) {
+            println("readTransaction-runBlocking")
+            callback(this@InternalDatabaseImpl)
         }
-    }
 
     // Register callback for table updates
     private fun tableUpdates(): Flow<List<String>> = driver.tableUpdates()

@@ -9,6 +9,7 @@ import com.powersync.db.internal.InternalTable
 import com.powersync.sync.SyncDataBatch
 import com.powersync.sync.SyncLocalDatabaseResult
 import com.powersync.utils.JsonUtil
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
 
 internal class BucketStorageImpl(
@@ -94,7 +95,7 @@ internal class BucketStorageImpl(
         logger.i { "[updateLocalTarget] Updating target to checkpoint $opId" }
 
         return db.writeTransaction { tx ->
-            if (hasCrud()) {
+            if (runBlocking { hasCrud() }) {
                 logger.w { "[updateLocalTarget] ps crud is not empty" }
                 return@writeTransaction false
             }
