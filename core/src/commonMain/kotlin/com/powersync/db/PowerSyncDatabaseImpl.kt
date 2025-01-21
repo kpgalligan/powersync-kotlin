@@ -61,19 +61,27 @@ internal class PowerSyncDatabaseImpl(
     private val internalDb = InternalDatabaseImpl(driver, scope)
     private val bucketStorage: BucketStorage = BucketStorageImpl(internalDb, logger)
 
+    /**
+     * Calls to ChannelPowerSyncTransaction are sent to a Coroutines Channel, which are then run inside the non-suspending
+     * SqlDelight transaction block. Results are sent back through a channel. This allows the calling block to retain
+     * its suspend capabilities, but the statements themselves to be run within the non-suspending block.
+     */
     internal class ChannelPowerSyncTransaction: PowerSyncTransaction{
         internal val operationChannel = Channel<Operation<*>>()
+        internal val resultChannel = Channel<OperationResult<*>>()
+
         fun finish(){
-            operationChannel.close()
+            runCatching { operationChannel.close() }
+            runCatching { resultChannel.close() }
         }
 
         override suspend fun execute(
             sql: String,
             parameters: List<Any?>?
         ): Long {
-            val op = Operation.Execute(sql, parameters)
+            val op = Operation.Execute(sql, parameters, resultChannel)
             operationChannel.send(op)
-            return op.resultQueue.receive()
+            return resultChannel.receive().valueOrThrow() as Long
         }
 
         override suspend fun <RowType : Any> getOptional(
@@ -81,9 +89,9 @@ internal class PowerSyncDatabaseImpl(
             parameters: List<Any?>?,
             mapper: (SqlCursor) -> RowType
         ): RowType? {
-            val op = Operation.GetOptional(sql, parameters, mapper)
+            val op = Operation.GetOptional(sql, parameters, mapper, resultChannel)
             operationChannel.send(op)
-            return op.resultQueue.receive()
+            return resultChannel.receive().valueOrThrow() as RowType?
         }
 
         override suspend fun <RowType : Any> getAll(
@@ -91,9 +99,9 @@ internal class PowerSyncDatabaseImpl(
             parameters: List<Any?>?,
             mapper: (SqlCursor) -> RowType
         ): List<RowType> {
-            val op = Operation.GetAll(sql, parameters, mapper)
+            val op = Operation.GetAll(sql, parameters, mapper, resultChannel)
             operationChannel.send(op)
-            return op.resultQueue.receive()
+            return resultChannel.receive().valueOrThrow() as List<RowType>
         }
 
         override suspend fun <RowType : Any> get(
@@ -101,27 +109,37 @@ internal class PowerSyncDatabaseImpl(
             parameters: List<Any?>?,
             mapper: (SqlCursor) -> RowType
         ): RowType {
-            val op = Operation.Get(sql, parameters, mapper)
+            val op = Operation.Get(sql, parameters, mapper, resultChannel)
             operationChannel.send(op)
-            return op.resultQueue.receive()
+            return resultChannel.receive().valueOrThrow() as RowType
         }
 
-        sealed class Operation<R> {
-            val resultQueue = Channel<R>()
+        sealed interface OperationResult<R> {
+            data class Result<R>(val result: R) : OperationResult<R>
+            data class Thrown(val throwable: Throwable) : OperationResult<Nothing>
+
+            fun valueOrThrow():R = when(this){
+                is Result -> this.result
+                is Thrown -> throw this.throwable
+            }
+        }
+
+        sealed class Operation<R>(private val resultQueue: Channel<OperationResult<*>>) {
+            var result: OperationResult<R>?=null
+
             abstract fun runSync(internalDb: InternalDatabaseImpl):R
 
             suspend fun result(r:Any?){
-                resultQueue.send(r as R)
-                resultQueue.close()
+                resultQueue.send(OperationResult.Result(r))
             }
 
-            fun error(t: Throwable){
-                resultQueue.close(t)
+            suspend fun error(t: Throwable){
+                resultQueue.send(OperationResult.Thrown(t))
             }
 
             data class Execute(
-                val sql: String, val parameters: List<Any?>?,
-            ) : Operation<Long>() {
+                val sql: String, val parameters: List<Any?>?, val resultQueue: Channel<OperationResult<*>>
+            ) : Operation<Long>(resultQueue) {
                 override fun runSync(internalDb: InternalDatabaseImpl): Long =internalDb.execute(sql, parameters)
             }
 
@@ -129,7 +147,8 @@ internal class PowerSyncDatabaseImpl(
                 val sql: String,
                 val parameters: List<Any?>?,
                 val mapper: (SqlCursor) -> RowType,
-                ) : Operation<RowType>() {
+                val resultQueue: Channel<OperationResult<*>>
+                ) : Operation<RowType>(resultQueue) {
 
                 override fun runSync(internalDb: InternalDatabaseImpl):RowType {
                     val r = internalDb.get(sql, parameters, mapper)
@@ -142,7 +161,8 @@ internal class PowerSyncDatabaseImpl(
                 val sql: String,
                 val parameters: List<Any?>?,
                 val mapper: (SqlCursor) -> RowType,
-            ) : Operation<List<RowType>>() {
+                val resultQueue: Channel<OperationResult<*>>
+            ) : Operation<List<RowType>>(resultQueue) {
                 override fun runSync(internalDb: InternalDatabaseImpl):List<RowType> =
                     internalDb.getAll(sql, parameters, mapper)
             }
@@ -151,7 +171,8 @@ internal class PowerSyncDatabaseImpl(
                 val sql: String,
                 val parameters: List<Any?>?,
                 val mapper: (SqlCursor) -> RowType,
-            ) : Operation<RowType?>() {
+                val resultQueue: Channel<OperationResult<*>>
+            ) : Operation<RowType?>(resultQueue) {
                 override fun runSync(internalDb: InternalDatabaseImpl):RowType? =
                     internalDb.getOptional(sql, parameters, mapper)
             }
@@ -336,9 +357,13 @@ internal class PowerSyncDatabaseImpl(
 
         val mainResult = withContext(Dispatchers.IO) {
             val topLoop = async {
-                val callbackResult = callback(t)
-                t.finish()
-                callbackResult
+                println("Starting channel pub/sub")
+                try {
+                    callback(t)
+                } finally {
+                    t.finish()
+                    println("Finishing channel pub/sub")
+                }
             }
 
             withContext(Dispatchers.IO) {
