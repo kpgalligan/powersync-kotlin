@@ -1,6 +1,7 @@
 package com.powersync.persistence.driver
 
 import app.cash.sqldelight.db.QueryResult
+import app.cash.sqldelight.db.SqlCursor
 import co.touchlab.sqliter.Cursor
 import co.touchlab.sqliter.getBytesOrNull
 import co.touchlab.sqliter.getDoubleOrNull

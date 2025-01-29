@@ -24,6 +24,11 @@ import app.cash.sqldelight.db.SqlPreparedStatement
 import app.cash.sqldelight.db.SqlSchema
 import com.powersync.persistence.driver.Api28Impl.setWindowSize
 
+import kotlin.collections.forEach
+import kotlin.collections.getOrPut
+import kotlin.io.use
+import kotlin.let
+
 private const val DEFAULT_CACHE_SIZE = 20
 
 public class AndroidSqliteDriver private constructor(
