@@ -129,6 +129,10 @@ kotlin {
             implementation(libs.ktor.client.okhttp)
         }
 
+        androidUnitTest.dependencies {
+            implementation("org.robolectric:robolectric:4.14")
+        }
+
         jvmMain.dependencies {
             implementation(libs.ktor.client.okhttp)
             implementation(libs.sqlite.jdbc)
