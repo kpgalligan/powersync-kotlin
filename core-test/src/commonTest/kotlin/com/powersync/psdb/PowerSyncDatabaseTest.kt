@@ -13,6 +13,8 @@ import kotlin.test.assertEquals
 
 expect abstract class RobolectricTest()
 
+expect fun cleanupDb()
+
 class PowerSyncDatabaseTest : RobolectricTest() {
     private lateinit var database: PowerSyncDatabase
 
@@ -32,6 +34,7 @@ class PowerSyncDatabaseTest : RobolectricTest() {
         runBlocking {
             database.disconnectAndClear()
         }
+        cleanupDb()
     }
 
     @Test
