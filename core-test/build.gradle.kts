@@ -30,6 +30,7 @@ kotlin {
 
         commonMain.dependencies {
             implementation(project(":core"))
+
         }
 
 //        androidUnitTest.dependencies {
@@ -39,6 +40,7 @@ kotlin {
         commonTest.dependencies {
             implementation(libs.kotlin.test)
             implementation(libs.test.coroutines)
+            implementation("co.touchlab:stately-concurrency:2.1.0")
         }
     }
 }
