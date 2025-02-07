@@ -4,6 +4,7 @@ import co.touchlab.stately.concurrency.AtomicBoolean
 import co.touchlab.stately.concurrency.Lock
 import com.powersync.DatabaseDriverFactory
 import com.powersync.PowerSyncDatabase
+import com.powersync.PowerSyncException
 import com.powersync.db.getString
 import com.powersync.db.schema.Column
 import com.powersync.db.schema.Schema
@@ -17,6 +18,7 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 expect abstract class RobolectricTest()
@@ -273,7 +275,7 @@ class PowerSyncDatabaseTest : RobolectricTest() {
     @Test
     fun testQueryNonExistentTable() {
         runBlocking {
-            assertFails {
+            assertFailsWith(PowerSyncException::class) {
                 database.get(
                     sql = "SELECT * FROM non_existent_table",
                     parameters = emptyList()
